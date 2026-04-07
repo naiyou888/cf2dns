@@ -23,8 +23,8 @@ else
 fi
 
 # 2. 设置核心参数
-TARGET_MTU=1420
-TARGET_MSS=1380
+TARGET_MTU=1380
+TARGET_MSS=1340
 
 # 3. 自动定位主网卡
 MAIN_IFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
