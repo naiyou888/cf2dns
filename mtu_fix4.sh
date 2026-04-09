@@ -1,79 +1,129 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -e
 
-# ==========================================
-# 网络优化脚本（安全版 - 适配 v2bx / sing-box）
-# 仅保留 BBR + 缓冲优化，移除 MTU/MSS 强制
-# ==========================================
+echo "==== 万金油网络优化（清理 + MTU + MSS + BBR）===="
 
-if [ "$EUID" -ne 0 ]; then 
-  echo "请用 root 运行"
-  exit 1
+# 获取默认网卡
+IFACE=$(ip route get 1.1.1.1 | awk '{print $5; exit}')
+echo "[+] 网卡: $IFACE"
+
+# =====================
+# 🧹 第一步：清理旧配置
+# =====================
+
+echo "[+] 清理旧配置..."
+
+# 恢复 MTU 默认
+ip link set dev $IFACE mtu 1500 || true
+
+# 清理 MSS 规则（只动 mangle）
+iptables -t mangle -F || true
+
+# 删除旧 sysctl 优化
+rm -f /etc/sysctl.d/*bbr*.conf 2>/dev/null || true
+rm -f /etc/sysctl.d/*net*.conf 2>/dev/null || true
+
+# 清理旧 qdisc
+tc qdisc del dev $IFACE root 2>/dev/null || true
+
+# 应用默认参数
+sysctl --system > /dev/null
+
+echo "[+] 清理完成"
+
+# =====================
+# 📡 第二步：多目标 MTU 探测
+# =====================
+
+TARGETS=(
+    "1.1.1.1"
+    "8.8.8.8"
+    "9.9.9.9"
+)
+
+probe_mtu() {
+    local TARGET=$1
+    local MIN=1200
+    local MAX=1500
+    local BEST=1400
+
+    while [ $MIN -le $MAX ]; do
+        MID=$(( (MIN + MAX) / 2 ))
+        if ping -c 1 -W 1 -M do -s $((MID-28)) $TARGET > /dev/null 2>&1; then
+            BEST=$MID
+            MIN=$((MID + 1))
+        else
+            MAX=$((MID - 1))
+        fi
+    done
+
+    echo $BEST
+}
+
+echo "[+] 开始 MTU 探测..."
+
+RESULTS=()
+
+for T in "${TARGETS[@]}"; do
+    echo "    -> 测试 $T"
+    MTU=$(probe_mtu $T)
+
+    if [ "$MTU" -ge 1300 ]; then
+        RESULTS+=($MTU)
+        echo "       MTU=$MTU"
+    else
+        echo "       MTU异常($MTU)，忽略"
+    fi
+done
+
+# fallback
+if [ ${#RESULTS[@]} -eq 0 ]; then
+    echo "[!] 探测失败，使用默认 MTU 1400"
+    BEST_MTU=1400
+else
+    BEST_MTU=$(printf "%s\n" "${RESULTS[@]}" | sort -n | head -n1)
 fi
 
-echo "--- 安装基础组件 ---"
-apt-get update -y -q
-apt-get install -y -q iptables iptables-persistent irqbalance
+echo "[+] 最终 MTU: $BEST_MTU"
 
-systemctl enable --now irqbalance 2>/dev/null
+# 设置 MTU
+ip link set dev $IFACE mtu $BEST_MTU
 
-echo "--- 清理旧 MTU / MSS 干扰 ---"
+# =====================
+# ⚙️ 第三步：MSS 优化
+# =====================
 
-# 删除 MSS 锁定规则
-iptables -t mangle -F POSTROUTING 2>/dev/null
-iptables -t mangle -F OUTPUT 2>/dev/null
+MSS=$((BEST_MTU - 40))
+echo "[+] MSS: $MSS"
 
-# 恢复默认 MTU（通常 1500）
-MAIN_IFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
-ip link set dev "$MAIN_IFACE" mtu 1500
+iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o $IFACE -j TCPMSS --set-mss $MSS
 
-echo "--- 应用 sysctl 优化 (BBR + UDP友好) ---"
+echo "[+] MSS 已设置"
 
-cat > /etc/sysctl.d/99-v2bx.conf << EOF
-fs.file-max=6553560
+# =====================
+# 🚀 第四步：BBR + 自动MTU修复
+# =====================
 
-# TCP 基础优化
-net.ipv4.tcp_no_metrics_save=1
-net.ipv4.tcp_ecn=0
-net.ipv4.tcp_frto=0
-net.ipv4.tcp_mtu_probing=1
-net.ipv4.tcp_rfc1337=1
-net.ipv4.tcp_sack=1
-net.ipv4.tcp_window_scaling=1
-net.ipv4.tcp_adv_win_scale=2
-net.ipv4.tcp_moderate_rcvbuf=1
-net.ipv4.tcp_timestamps=1
-net.ipv4.tcp_tw_reuse=1
-
-# 队列
-net.core.somaxconn=4096
-net.ipv4.tcp_max_syn_backlog=4096
-
-# 缓冲区（重点：避免 too long）
-net.core.rmem_max=33554432
-net.core.wmem_max=33554432
-net.ipv4.tcp_rmem=4096 65536 33554432
-net.ipv4.tcp_wmem=4096 65536 33554432
-net.ipv4.udp_rmem_min=16384
-net.ipv4.udp_wmem_min=16384
-
-# conntrack（防止爆连接）
-net.netfilter.nf_conntrack_max=1048576
-net.netfilter.nf_conntrack_tcp_timeout_time_wait=30
-net.netfilter.nf_conntrack_udp_timeout=60
-net.netfilter.nf_conntrack_udp_timeout_stream=120
-
-# BBR
+cat > /etc/sysctl.d/99-auto-net.conf <<EOF
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 
-# 端口范围
-net.ipv4.ip_local_port_range=1024 65535
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_base_mss=1024
+net.ipv4.tcp_mtu_probe_floor=552
+
+net.ipv4.tcp_fastopen=3
+net.ipv4.tcp_window_scaling=1
 EOF
 
-sysctl --system
+sysctl --system > /dev/null
 
-echo "======================================"
-echo "BBR: $(sysctl net.ipv4.tcp_congestion_control | awk '{print $3}')"
-echo "MTU: $(ip link show $MAIN_IFACE | grep -o 'mtu [0-9]*')"
-echo "MSS: 已恢复系统自动"
-echo "======================================"
+# =====================
+# 📊 第五步：结果输出
+# =====================
+
+echo "==== 当前状态 ===="
+ip link show $IFACE | grep mtu
+sysctl net.ipv4.tcp_congestion_control | awk '{print $3}'
+
+echo "==== 完成（稳定万金油版）===="
