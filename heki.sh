@@ -1,4 +1,3 @@
-```bash
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
@@ -244,4 +243,3 @@ echo "规则数量：$(wc -l < "${TMP_FILE}")"
 echo
 
 docker compose ps
-```
