@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Landing Server BBR/TCP Auto Optimizer
+# AnyTLS/IEPL BBR/TCP Auto Optimizer
 # Generic Debian/Ubuntu Linux TCP tuning script for TCP landing/proxy servers.
 # Default behavior: auto-detect and apply recommended BBR/fq sysctl settings.
 
 set -Eeuo pipefail
 
-VERSION="2026.04.28-final"
+VERSION="2026.06.13-role-edition"
 
 CONF_FILE="/etc/sysctl.d/99-landing-bbr-auto.conf"
 LIMITS_FILE="/etc/security/limits.d/99-landing-bbr-nofile.conf"
@@ -14,6 +14,7 @@ SYSTEMD_MANAGER_FILE="${SYSTEMD_MANAGER_DIR}/99-landing-bbr-nofile.conf"
 BACKUP_ROOT="/var/backups/landing-bbr-auto"
 
 MODE="apply"
+ROLE="${ROLE:-landing}"
 PROFILE="auto"
 APPLY_TC=1
 FORCE_TC=0
@@ -21,6 +22,8 @@ ROLLBACK=0
 INSTALL_DEPS=1
 LINK_MBPS="${LINK_MBPS:-}"
 RTT_MS="${RTT_MS:-180}"
+RTT_EXPLICIT=0
+LINK_EXPLICIT=0
 NET_STABLE="${NET_STABLE:-auto}"
 
 MiB=$((1024 * 1024))
@@ -35,14 +38,23 @@ warn() { WARNINGS+=("$*"); }
 
 usage() {
   cat <<USAGE
-Landing Server BBR/TCP Auto Optimizer v${VERSION}
+AnyTLS/IEPL BBR/TCP Auto Optimizer v${VERSION}
 
 Default behavior with no args: auto-detect and APPLY recommended settings.
 
 Usage:
-  sudo bash landing-bbr-auto.sh
-  sudo bash landing-bbr-auto.sh --dry-run
+  sudo bash landing-bbr-auto.sh 1
+  sudo bash landing-bbr-auto.sh 2
+  sudo bash landing-bbr-auto.sh --role landing
+  sudo bash landing-bbr-auto.sh --role iepl --link-mbps 500
+  sudo bash landing-bbr-auto.sh --dry-run --role iepl
   sudo bash landing-bbr-auto.sh --rollback
+
+Role options:
+  1, --role landing                 AnyTLS landing/proxy server role. Default.
+                                    Balanced BBR/fq, larger backlog, adaptive buffers.
+  2, --role iepl                    Domestic IEPL entrance role.
+                                    Conservative BBR/fq, lower queue/buffer, lower jitter.
 
 Options:
   --dry-run                         Preview only, do not apply.
@@ -51,17 +63,18 @@ Options:
   --force-tc                        Force qdisc replacement even if current qdisc looks custom.
   --rollback                        Restore latest backup made by this script.
   --profile auto|safe|balanced|aggressive
-                                    Default: auto.
-  --link-mbps N                     Override detected link speed. Useful on VPS.
-  --rtt-ms N                        RTT assumption for TCP buffer sizing. Default: 180.
+                                    Default: auto. For --role iepl, auto uses IEPL-safe caps.
+  --link-mbps N                     Override detected link speed. Recommended for IEPL, e.g. 500.
+  --rtt-ms N                        RTT assumption for TCP buffer sizing. Default: landing 180, iepl 30 if not set.
   --net-stable auto|0|1             1 = stable network, tcp_slow_start_after_idle=0.
                                     0 = unstable network, tcp_slow_start_after_idle=1.
   --no-install-deps                 Do not install missing Debian/Ubuntu helper packages.
   -h, --help
 
 GitHub one-liner examples:
-  curl -fsSL RAW_GITHUB_URL | sudo bash
-  curl -fsSL RAW_GITHUB_URL | sudo bash -s -- --dry-run
+  curl -fsSL RAW_GITHUB_URL | sudo bash -s -- 1
+  curl -fsSL RAW_GITHUB_URL | sudo bash -s -- 2 --link-mbps 500
+  curl -fsSL RAW_GITHUB_URL | sudo bash -s -- --dry-run --role iepl
   curl -fsSL RAW_GITHUB_URL | sudo bash -s -- --rollback
 USAGE
 }
@@ -113,20 +126,34 @@ add_sysctl() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    1|landing|anytls) ROLE="landing"; shift ;;
+    2|iepl) ROLE="iepl"; shift ;;
+    --role) ROLE="${2:-}"; shift 2 ;;
     --dry-run) MODE="dry-run"; shift ;;
     --apply) MODE="apply"; shift ;;
     --no-tc) APPLY_TC=0; shift ;;
     --force-tc) FORCE_TC=1; APPLY_TC=1; shift ;;
     --rollback) ROLLBACK=1; shift ;;
     --profile) PROFILE="${2:-}"; shift 2 ;;
-    --link-mbps) LINK_MBPS="${2:-}"; shift 2 ;;
-    --rtt-ms) RTT_MS="${2:-}"; shift 2 ;;
+    --link-mbps) LINK_MBPS="${2:-}"; LINK_EXPLICIT=1; shift 2 ;;
+    --rtt-ms) RTT_MS="${2:-}"; RTT_EXPLICIT=1; shift 2 ;;
     --net-stable) NET_STABLE="${2:-}"; shift 2 ;;
     --no-install-deps) INSTALL_DEPS=0; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
   esac
 done
+
+case "$ROLE" in
+  landing|anytls) ROLE="landing" ;;
+  iepl) ROLE="iepl" ;;
+  *) echo "ERROR: --role must be landing or iepl." >&2; exit 1 ;;
+esac
+
+# IEPL is usually low-RTT private transport. The old 180ms default is too aggressive there.
+if [[ "$ROLE" == "iepl" && "$RTT_EXPLICIT" == "0" ]]; then
+  RTT_MS=30
+fi
 
 if [[ ! "$PROFILE" =~ ^(auto|safe|balanced|aggressive)$ ]]; then
   echo "ERROR: --profile must be auto, safe, balanced, or aggressive." >&2
@@ -424,12 +451,22 @@ CPU_COUNT="$(command -v nproc >/dev/null 2>&1 && nproc || getconf _NPROCESSORS_O
 PAGE_SIZE="$(getconf PAGE_SIZE 2>/dev/null || echo 4096)"
 IFACE="$(detect_default_iface)"
 LINK_Mbps="$(detect_link_mbps "$IFACE")"
+# For IEPL entrance machines, NIC speed on VPS often shows 1000M/10G while the product is 500M.
+# Use 500M as a safer default unless explicitly overridden.
+if [[ "$ROLE" == "iepl" && "$LINK_EXPLICIT" == "0" && "$LINK_Mbps" -gt 500 ]]; then
+  warn "IEPL 模式未指定 --link-mbps，检测到 ${LINK_Mbps} Mbps，按 500 Mbps 估算。可用 --link-mbps 覆盖。"
+  LINK_Mbps=500
+fi
 CURRENT_QDISC="$(detect_qdisc_now "$IFACE")"
 CURRENT_CC="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
 AVAILABLE_CC="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
 SELECTED_CC="$(detect_congestion_control)"
 NET_IS_STABLE="$(detect_net_stable)"
 SELECTED_PROFILE="$(choose_profile "$MEM_MB" "$CPU_COUNT" "$LINK_Mbps")"
+case "$ROLE" in
+  landing) ROLE_DESC="AnyTLS landing/proxy server" ;;
+  iepl) ROLE_DESC="Domestic IEPL entrance" ;;
+esac
 
 case "$OS_ID" in
   debian|ubuntu) ;;
@@ -473,6 +510,33 @@ case "$SELECTED_PROFILE" in
     ;;
 esac
 
+# Role-specific policy layer.
+# landing: keep adaptive high-concurrency proxy defaults.
+# iepl: avoid excessive socket queues on a fixed 500M/low-RTT private line.
+TCP_BUF_MIN=$((4 * MiB))
+ABORT_ON_OVERFLOW=0
+TCP_WMEM_MID=65536
+TCP_RMEM_MID=131072
+SET_TCP_FASTOPEN=1
+SET_TCP_NOTSENT_LOWAT=0
+TCP_NOTSENT_LOWAT_VALUE=0
+
+if [[ "$ROLE" == "iepl" ]]; then
+  # IEPL entrance should prefer low jitter over large queue depth.
+  PROFILE_BUF_CAP=$((16 * MiB))
+  TCP_BUF_MIN=$((8 * MiB))
+  SOMAX=8192
+  SYN_BACKLOG=8192
+  NETDEV_BACKLOG=8192
+  TCP_MEM_PCT=10
+  NOFILE_TARGET=524288
+  TCP_WMEM_MID=131072
+  TCP_RMEM_MID=131072
+else
+  # AnyTLS landing: safe high-concurrency server defaults.
+  ABORT_ON_OVERFLOW=0
+fi
+
 # TCP buffer sizing:
 # BDP = bandwidth * RTT. Use 2x BDP but cap by RAM/profile to avoid memory pressure.
 BDP_BYTES=$(( LINK_Mbps * 1000000 / 8 * RTT_MS / 1000 ))
@@ -480,10 +544,14 @@ TARGET_BUF=$(( BDP_BYTES * 2 ))
 RAM_BUF_CAP=$(( MEM_BYTES / 64 ))
 RAM_BUF_CAP="$(max "$RAM_BUF_CAP" $((4 * MiB)))"
 EFFECTIVE_BUF_CAP="$(min "$PROFILE_BUF_CAP" "$RAM_BUF_CAP")"
-TCP_BUF_MAX="$(clamp "$TARGET_BUF" $((4 * MiB)) "$EFFECTIVE_BUF_CAP")"
+TCP_BUF_MAX="$(clamp "$TARGET_BUF" "$TCP_BUF_MIN" "$EFFECTIVE_BUF_CAP")"
 
 RMEM_DEFAULT="$(clamp $((TCP_BUF_MAX / 16)) 131072 $((1 * MiB)))"
 WMEM_DEFAULT="$(clamp $((TCP_BUF_MAX / 32)) 65536 $((1 * MiB)))"
+if [[ "$ROLE" == "iepl" ]]; then
+  RMEM_DEFAULT="$(clamp $((TCP_BUF_MAX / 16)) 262144 $((512 * 1024)))"
+  WMEM_DEFAULT="$(clamp $((TCP_BUF_MAX / 32)) 131072 $((512 * 1024)))"
+fi
 
 TCP_MEM_MAX_PAGES=$(( MEM_BYTES * TCP_MEM_PCT / 100 / PAGE_SIZE ))
 TCP_MEM_PRESSURE_PAGES=$(( TCP_MEM_MAX_PAGES * 3 / 4 ))
@@ -531,7 +599,7 @@ add_sysctl net.ipv4.tcp_max_tw_buckets "$TW_BUCKETS"
 add_sysctl net.ipv4.tcp_max_syn_backlog "$SYN_BACKLOG"
 add_sysctl net.core.somaxconn "$SOMAX"
 add_sysctl net.core.netdev_max_backlog "$NETDEV_BACKLOG"
-add_sysctl net.ipv4.tcp_abort_on_overflow 1
+add_sysctl net.ipv4.tcp_abort_on_overflow "$ABORT_ON_OVERFLOW"
 add_sysctl net.ipv4.tcp_syncookies 1
 
 # TCP behavior
@@ -541,6 +609,12 @@ add_sysctl net.ipv4.tcp_sack 1
 add_sysctl net.ipv4.tcp_window_scaling 1
 add_sysctl net.ipv4.tcp_moderate_rcvbuf 1
 add_sysctl net.ipv4.tcp_no_metrics_save 1
+if (( SET_TCP_FASTOPEN == 1 )); then
+  add_sysctl net.ipv4.tcp_fastopen 3
+fi
+if (( SET_TCP_NOTSENT_LOWAT == 1 )); then
+  add_sysctl net.ipv4.tcp_notsent_lowat "$TCP_NOTSENT_LOWAT_VALUE"
+fi
 
 # Memory and file limits
 add_sysctl vm.swappiness 10
@@ -553,13 +627,14 @@ add_sysctl net.core.wmem_max "$TCP_BUF_MAX"
 add_sysctl net.core.rmem_default "$RMEM_DEFAULT"
 add_sysctl net.core.wmem_default "$WMEM_DEFAULT"
 add_sysctl net.ipv4.tcp_mem "$TCP_MEM_MIN_PAGES $TCP_MEM_PRESSURE_PAGES $TCP_MEM_MAX_PAGES"
-add_sysctl net.ipv4.tcp_rmem "4096 131072 $TCP_BUF_MAX"
-add_sysctl net.ipv4.tcp_wmem "4096 65536 $TCP_BUF_MAX"
+add_sysctl net.ipv4.tcp_rmem "4096 $TCP_RMEM_MID $TCP_BUF_MAX"
+add_sysctl net.ipv4.tcp_wmem "4096 $TCP_WMEM_MID $TCP_BUF_MAX"
 
 print_report() {
   echo
   echo "================ Landing BBR Auto Optimizer v${VERSION} ================"
   echo "Mode:                 ${MODE}"
+  echo "Role:                 ${ROLE} (${ROLE_DESC})"
   echo "OS:                   ${OS_NAME}"
   echo "Kernel:               ${KERNEL}"
   echo "Virt:                 ${VIRT_TYPE:-unknown}"
@@ -573,6 +648,7 @@ print_report() {
   echo "Current qdisc:        ${CURRENT_QDISC:-unknown}"
   echo "Selected qdisc:       ${QDISC}"
   echo "Auto profile:         ${SELECTED_PROFILE}"
+  echo "Abort on overflow:    ${ABORT_ON_OVERFLOW}"
   echo "TCP buffer max:       $(human_bytes "$TCP_BUF_MAX")"
   echo "tcp_mem pages:        ${TCP_MEM_MIN_PAGES} ${TCP_MEM_PRESSURE_PAGES} ${TCP_MEM_MAX_PAGES}"
   echo "somaxconn/backlog:    ${SOMAX}/${SYN_BACKLOG}"
@@ -594,7 +670,7 @@ print_report() {
   echo "================ Generated sysctl ================"
   cat <<HEADER
 # Generated by landing-bbr-auto.sh v${VERSION} on $(date -Is)
-# Generic landing/proxy server TCP optimization
+# AnyTLS landing / IEPL entrance TCP optimization
 # OS=${OS_NAME}
 # Kernel=${KERNEL}
 # CPU=${CPU_COUNT}
@@ -602,6 +678,7 @@ print_report() {
 # iface=${IFACE}
 # link=${LINK_Mbps}Mbps
 # rtt=${RTT_MS}ms
+# role=${ROLE} (${ROLE_DESC})
 # profile=${SELECTED_PROFILE}
 # selected_cc=${SELECTED_CC:-keep-current}
 # qdisc=${QDISC}
@@ -615,7 +692,7 @@ write_files() {
   {
     cat <<HEADER
 # Generated by landing-bbr-auto.sh v${VERSION} on $(date -Is)
-# Generic landing/proxy server TCP optimization
+# AnyTLS landing / IEPL entrance TCP optimization
 # OS=${OS_NAME}
 # Kernel=${KERNEL}
 # CPU=${CPU_COUNT}
@@ -623,6 +700,7 @@ write_files() {
 # iface=${IFACE}
 # link=${LINK_Mbps}Mbps
 # rtt=${RTT_MS}ms
+# role=${ROLE} (${ROLE_DESC})
 # profile=${SELECTED_PROFILE}
 # selected_cc=${SELECTED_CC:-keep-current}
 # qdisc=${QDISC}
