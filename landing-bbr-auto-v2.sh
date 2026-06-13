@@ -2,10 +2,11 @@
 # AnyTLS/IEPL BBR/TCP Auto Optimizer
 # Generic Debian/Ubuntu Linux TCP tuning script for TCP landing/proxy servers.
 # Default behavior: auto-detect and apply recommended BBR/fq sysctl settings.
+# LF-normalized release: v2.1, safe for raw.githubusercontent.com | sudo bash.
 
 set -Eeuo pipefail
 
-VERSION="2026.06.13-v2-production"
+VERSION="2026.06.13-v2.1-production-lf"
 
 CONF_FILE="/etc/sysctl.d/99-landing-bbr-auto.conf"
 LIMITS_FILE="/etc/security/limits.d/99-landing-bbr-nofile.conf"
